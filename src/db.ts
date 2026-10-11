@@ -32,8 +32,12 @@ CREATE TABLE IF NOT EXISTS change_requests (
   answered_by_version INTEGER,
   answered_at TEXT,
   answered_late INTEGER,
-  UNIQUE (script_id, version_number)
+  replaced_at TEXT,
+  replaced_by TEXT
 );
+-- Um pedido ativo por versão; o substituído (prazo vencido) continua guardado.
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_change_request_per_version
+  ON change_requests (script_id, version_number) WHERE replaced_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS script_events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,10 +70,24 @@ BEGIN
 END;
 `;
 
+// Sem migrations: o schema tem versão, e um banco criado por outra versão é recusado com uma mensagem clara
+// (em vez de falhar no meio de uma requisição).
+const SCHEMA_VERSION = 2;
+
 export function openDatabase(path: string): DatabaseSync {
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
-  db.exec("PRAGMA foreign_keys = ON;");
+  // Outra conexão no mesmo arquivo espera a vez (até 5 s) em vez de falhar na hora com "database is locked".
+  db.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+  const { user_version: version } = db.prepare("PRAGMA user_version").get() as { user_version: number };
+  const empty = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table'").get() === undefined;
+  if (!empty && version !== SCHEMA_VERSION) {
+    db.close();
+    throw new Error(
+      `${path} foi criado por outra versão do schema (${version}; esta é a ${SCHEMA_VERSION}). Não há migrations: apague o arquivo ou use outro DB_PATH.`,
+    );
+  }
   db.exec(SCHEMA);
+  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   return db;
 }

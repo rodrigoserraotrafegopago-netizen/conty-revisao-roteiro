@@ -32,6 +32,8 @@ type ChangeRequestRow = {
   answered_by_version: number | null;
   answered_at: string | null;
   answered_late: number | null;
+  replaced_at: string | null;
+  replaced_by: string | null;
 };
 
 type EventRow = {
@@ -57,6 +59,9 @@ export type ChangeRequestView = {
   answered_by_version: number | null;
   answered_at: string | null;
   answered_on_time: boolean | null;
+  overdue: boolean;
+  replaced_at: string | null;
+  replaced_by: string | null;
 };
 
 export type VersionView = {
@@ -78,6 +83,7 @@ export type ScriptView = {
   allowed_actions: ReturnType<typeof allowedActions>;
   open_change_request: ChangeRequestView | null;
   versions: VersionView[];
+  change_requests: ChangeRequestView[];
   history: Array<{
     seq: number;
     type: string;
@@ -135,7 +141,12 @@ export function createScriptService({
     return row;
   }
 
+  function conflict(): DomainError {
+    return new DomainError("conflito", "O roteiro mudou de estado durante a operação. Consulte e tente de novo.", 409);
+  }
+
   // UPDATE condicionado ao estado esperado: se outra requisição mudou o roteiro antes, esta falha em vez de sobrescrever.
+  // Vem primeiro em cada transação, antes de qualquer outra escrita.
   function moveScript(
     id: string,
     from: ScriptStatus,
@@ -149,9 +160,7 @@ export function createScriptService({
           WHERE id = ? AND status = ?`,
       )
       .run(to, extra.currentVersion ?? null, extra.approvedAt ?? null, id, from);
-    if (Number(result.changes) !== 1) {
-      throw new DomainError("conflito", "O roteiro mudou de estado durante a operação. Consulte e tente de novo.", 409);
-    }
+    if (Number(result.changes) !== 1) throw conflict();
   }
 
   function recordEvent(
@@ -167,6 +176,24 @@ export function createScriptService({
     ).run(scriptId, type, actor, version, at, detail ? JSON.stringify(detail) : null);
   }
 
+  function isOverdue(row: ChangeRequestRow, timeZone: string): boolean {
+    const open = row.answered_by_version === null && row.replaced_at === null;
+    return open && !isWithinDueDate(row.due_date, clock.now(), timeZone);
+  }
+
+  function activeChangeRequest(scriptId: string, version: number): ChangeRequestRow | undefined {
+    return db
+      .prepare("SELECT * FROM change_requests WHERE script_id = ? AND version_number = ? AND replaced_at IS NULL")
+      .get(scriptId, version) as ChangeRequestRow | undefined;
+  }
+
+  // Pedido aberto da versão atual e se o prazo dele já venceu (aí a marca pode trocá-lo).
+  function openRequestOf(script: ScriptRow): { row: ChangeRequestRow | undefined; overdue: boolean } {
+    const row =
+      script.status === "changes_requested" ? activeChangeRequest(script.id, script.current_version) : undefined;
+    return { row, overdue: row !== undefined && isOverdue(row, script.timezone) };
+  }
+
   function toChangeRequestView(row: ChangeRequestRow, timeZone: string): ChangeRequestView {
     return {
       id: row.id,
@@ -178,6 +205,9 @@ export function createScriptService({
       answered_by_version: row.answered_by_version,
       answered_at: row.answered_at,
       answered_on_time: row.answered_late === null ? null : row.answered_late === 0,
+      overdue: isOverdue(row, timeZone),
+      replaced_at: row.replaced_at,
+      replaced_by: row.replaced_by,
     };
   }
 
@@ -187,7 +217,7 @@ export function createScriptService({
       .prepare("SELECT * FROM script_versions WHERE script_id = ? ORDER BY number")
       .all(id) as VersionRow[];
     const changeRequests = db
-      .prepare("SELECT * FROM change_requests WHERE script_id = ? ORDER BY version_number")
+      .prepare("SELECT * FROM change_requests WHERE script_id = ? ORDER BY requested_at, rowid")
       .all(id) as ChangeRequestRow[];
     const events = db
       .prepare(
@@ -195,9 +225,9 @@ export function createScriptService({
       )
       .all(id) as EventRow[];
 
-    const byVersion = new Map(
-      changeRequests.map((cr) => [cr.version_number, toChangeRequestView(cr, script.timezone)]),
-    );
+    const views = changeRequests.map((cr) => toChangeRequestView(cr, script.timezone));
+    const byVersion = new Map(views.filter((cr) => cr.replaced_at === null).map((cr) => [cr.version, cr]));
+    const open = script.status === "changes_requested" ? (byVersion.get(script.current_version) ?? null) : null;
     return {
       id: script.id,
       title: script.title,
@@ -206,9 +236,8 @@ export function createScriptService({
       current_version: script.current_version,
       created_at: script.created_at,
       approved_at: script.approved_at,
-      allowed_actions: allowedActions(script.status),
-      open_change_request:
-        script.status === "changes_requested" ? (byVersion.get(script.current_version) ?? null) : null,
+      allowed_actions: allowedActions(script.status, open?.overdue ?? false),
+      open_change_request: open,
       versions: versions.map((v) => ({
         number: v.number,
         status: v.status,
@@ -216,6 +245,7 @@ export function createScriptService({
         content: v.content,
         change_request: byVersion.get(v.number) ?? null,
       })),
+      change_requests: views,
       history: events.map((e) => ({
         seq: e.seq,
         type: e.type,
@@ -257,7 +287,8 @@ export function createScriptService({
 
     requestChanges(id: string, input: unknown): ScriptView {
       const script = loadScript(id);
-      const next = assertCanTransition(script.status, "request_changes");
+      const { row: current, overdue: renewing } = openRequestOf(script);
+      const next = assertCanTransition(script.status, "request_changes", renewing);
 
       const reason = requireText(field(input, "reason"), REASON).trim();
       const dueDate = field(input, "due_date");
@@ -280,6 +311,17 @@ export function createScriptService({
       const now = nowInstant.toISOString();
       const changeRequestId = newId();
       transaction(() => {
+        moveScript(id, script.status, next);
+        if (renewing && current) {
+          // Na troca o estado não muda; quem garante que ninguém trocou ou respondeu antes é esta condição.
+          const replaced = db
+            .prepare(
+              `UPDATE change_requests SET replaced_at = ?, replaced_by = ?
+                WHERE id = ? AND replaced_at IS NULL AND answered_by_version IS NULL`,
+            )
+            .run(now, changeRequestId, current.id);
+          if (Number(replaced.changes) !== 1) throw conflict();
+        }
         db.prepare(
           "INSERT INTO change_requests (id, script_id, version_number, reason, due_date, requested_at) VALUES (?, ?, ?, ?, ?, ?)",
         ).run(changeRequestId, id, script.current_version, reason, dueDate, now);
@@ -287,12 +329,19 @@ export function createScriptService({
           id,
           script.current_version,
         );
-        moveScript(id, script.status, next);
-        recordEvent(id, "changes_requested", "brand", script.current_version, now, {
-          change_request_id: changeRequestId,
-          reason,
-          due_date: dueDate,
-        });
+        recordEvent(
+          id,
+          renewing ? "change_request_renewed" : "changes_requested",
+          "brand",
+          script.current_version,
+          now,
+          {
+            change_request_id: changeRequestId,
+            reason,
+            due_date: dueDate,
+            ...(renewing && current ? { replaces: current.id } : {}),
+          },
+        );
       });
       return getScript(id);
     },
@@ -302,9 +351,7 @@ export function createScriptService({
       const next = assertCanTransition(script.status, "submit_version");
       const content = requireText(field(input, "content"), CONTENT);
 
-      const openRequest = db
-        .prepare("SELECT * FROM change_requests WHERE script_id = ? AND version_number = ?")
-        .get(id, script.current_version) as ChangeRequestRow | undefined;
+      const openRequest = activeChangeRequest(id, script.current_version);
       if (!openRequest) throw new Error(`roteiro ${id} em changes_requested sem pedido de alteração`);
 
       const nowInstant = clock.now();
@@ -313,13 +360,17 @@ export function createScriptService({
       const number = script.current_version + 1;
 
       transaction(() => {
+        moveScript(id, script.status, next, { currentVersion: number });
+        const answered = db
+          .prepare(
+            `UPDATE change_requests SET answered_by_version = ?, answered_at = ?, answered_late = ?
+              WHERE id = ? AND replaced_at IS NULL AND answered_by_version IS NULL`,
+          )
+          .run(number, now, onTime ? 0 : 1, openRequest.id);
+        if (Number(answered.changes) !== 1) throw conflict();
         db.prepare(
           "INSERT INTO script_versions (script_id, number, content, status, submitted_at) VALUES (?, ?, ?, 'in_review', ?)",
         ).run(id, number, content, now);
-        db.prepare(
-          "UPDATE change_requests SET answered_by_version = ?, answered_at = ?, answered_late = ? WHERE id = ?",
-        ).run(number, now, onTime ? 0 : 1, openRequest.id);
-        moveScript(id, script.status, next, { currentVersion: number });
         recordEvent(id, "version_submitted", "creator", number, now, {
           answers_change_request: openRequest.id,
           on_time: onTime,
@@ -330,15 +381,15 @@ export function createScriptService({
 
     approve(id: string): ScriptView {
       const script = loadScript(id);
-      const next = assertCanTransition(script.status, "approve");
+      const next = assertCanTransition(script.status, "approve", openRequestOf(script).overdue);
       const now = clock.now().toISOString();
 
       transaction(() => {
+        moveScript(id, script.status, next, { approvedAt: now });
         db.prepare("UPDATE script_versions SET status = 'approved' WHERE script_id = ? AND number = ?").run(
           id,
           script.current_version,
         );
-        moveScript(id, script.status, next, { approvedAt: now });
         recordEvent(id, "approved", "brand", script.current_version, now);
       });
       return getScript(id);

@@ -2,6 +2,7 @@ import { DomainError } from "./errors.ts";
 
 //   in_review ──request_changes──▶ changes_requested ──submit_version──▶ in_review
 //   in_review ──approve──────────▶ approved (final)
+//   changes_requested, com o prazo do pedido vencido ──request_changes──▶ changes_requested (novo pedido)
 
 export type ScriptStatus = "in_review" | "changes_requested" | "approved";
 export type Action = "request_changes" | "approve" | "submit_version";
@@ -13,11 +14,17 @@ export const ACTIONS: Record<Action, { actor: Actor; from: ScriptStatus; to: Scr
   submit_version: { actor: "creator", from: "changes_requested", to: "in_review" },
 };
 
-export function allowedActions(status: ScriptStatus): Record<Actor, Action[]> {
+// Pedido de alteração com prazo vencido continua aberto (o criador ainda pode responder), mas a marca pode
+// trocá-lo por um novo.
+function canRenew(status: ScriptStatus, action: Action, overdue: boolean): boolean {
+  return action === "request_changes" && status === "changes_requested" && overdue;
+}
+
+export function allowedActions(status: ScriptStatus, overdue = false): Record<Actor, Action[]> {
   const allowed: Record<Actor, Action[]> = { brand: [], creator: [] };
   for (const action of Object.keys(ACTIONS) as Action[]) {
     const rule = ACTIONS[action];
-    if (rule.from === status) allowed[rule.actor].push(action);
+    if (rule.from === status || canRenew(status, action, overdue)) allowed[rule.actor].push(action);
   }
   return allowed;
 }
@@ -25,14 +32,16 @@ export function allowedActions(status: ScriptStatus): Record<Actor, Action[]> {
 const BLOCKED_MESSAGES: Partial<Record<`${ScriptStatus}:${Action}`, string>> = {
   "in_review:submit_version":
     "O roteiro está com a marca para revisão. Nova versão só depois de um pedido de alteração.",
-  "changes_requested:request_changes": "Já existe um pedido de alteração aberto, aguardando a nova versão do criador.",
+  "changes_requested:request_changes":
+    "Já existe um pedido de alteração aberto. A marca só pode trocá-lo depois que o prazo dele vencer.",
   "changes_requested:approve":
     "A versão atual tem pedido de alteração aberto. A marca aprova depois que o criador reenviar.",
 };
 
-export function assertCanTransition(status: ScriptStatus, action: Action): ScriptStatus {
+export function assertCanTransition(status: ScriptStatus, action: Action, overdue = false): ScriptStatus {
   const rule = ACTIONS[action];
   if (rule.from === status) return rule.to;
+  if (canRenew(status, action, overdue)) return status;
 
   if (status === "approved") {
     throw new DomainError(
@@ -46,6 +55,6 @@ export function assertCanTransition(status: ScriptStatus, action: Action): Scrip
     "transicao_invalida",
     BLOCKED_MESSAGES[`${status}:${action}`] ?? `A ação ${action} não vale no estado ${status}.`,
     409,
-    { status, allowed_actions: allowedActions(status) },
+    { status, allowed_actions: allowedActions(status, overdue) },
   );
 }

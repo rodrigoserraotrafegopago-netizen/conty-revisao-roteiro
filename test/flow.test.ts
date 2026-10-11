@@ -1,4 +1,9 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
+import { openDatabase } from "../src/db.ts";
 import type { VersionView } from "../src/scripts.ts";
 import { json, setup } from "./helpers.ts";
 
@@ -133,6 +138,79 @@ describe("pedido de alteração", () => {
   });
 });
 
+describe("pedido de alteração vencido", () => {
+  async function scriptWithRequestDue(dueDate: string) {
+    const t = setup();
+    const script = await t.createScript();
+    await t.post(`/scripts/${script.id}/change-requests`, { reason: "Encurtar", due_date: dueDate });
+    return { t, id: script.id };
+  }
+
+  it("aparece como vencido a partir do primeiro instante do dia seguinte, e a marca pode trocá-lo", async () => {
+    const { t, id } = await scriptWithRequestDue("2026-03-12");
+
+    t.setNow(LAST_INSTANT_OF_MARCH_12_SP);
+    const beforeDeadline = await json(await t.get(`/scripts/${id}`));
+    expect(beforeDeadline.open_change_request?.overdue).toBe(false);
+    expect(beforeDeadline.allowed_actions).toEqual({ brand: [], creator: ["submit_version"] });
+
+    t.setNow(FIRST_INSTANT_OF_MARCH_13_SP);
+    const overdue = await json(await t.get(`/scripts/${id}`));
+    expect(overdue.open_change_request?.overdue).toBe(true);
+    expect(overdue.allowed_actions).toEqual({ brand: ["request_changes"], creator: ["submit_version"] });
+  });
+
+  it("um novo pedido substitui o vencido e o histórico guarda os dois", async () => {
+    const { t, id } = await scriptWithRequestDue("2026-03-12");
+    t.setNow(FIRST_INSTANT_OF_MARCH_13_SP);
+
+    const res = await t.post(`/scripts/${id}/change-requests`, {
+      reason: "Encurtar para 30 segundos",
+      due_date: "2026-03-20",
+    });
+    expect(res.status).toBe(201);
+    const body = await json(res);
+    expect(body.status).toBe("changes_requested");
+    expect(body.open_change_request).toMatchObject({
+      reason: "Encurtar para 30 segundos",
+      due_date: "2026-03-20",
+      overdue: false,
+    });
+    expect(body.change_requests).toHaveLength(2);
+    expect(body.change_requests[0]).toMatchObject({
+      due_date: "2026-03-12",
+      replaced_by: body.open_change_request?.id,
+    });
+    expect(body.history.at(-1)).toMatchObject({ type: "change_request_renewed", actor: "brand", version: 1 });
+
+    const resubmitted = await json(await t.post(`/scripts/${id}/versions`, { content: "Versão 2" }));
+    expect(resubmitted.versions[0]?.change_request).toMatchObject({
+      due_date: "2026-03-20",
+      answered_by_version: 2,
+      answered_on_time: true,
+    });
+  });
+
+  it("antes de vencer, a marca não troca o pedido", async () => {
+    const { t, id } = await scriptWithRequestDue("2026-03-12");
+    t.setNow(LAST_INSTANT_OF_MARCH_12_SP);
+    const res = await t.post(`/scripts/${id}/change-requests`, { reason: "Outra coisa", due_date: "2026-03-20" });
+    expect(res.status).toBe(409);
+    expect(await json(res)).toMatchObject({ error: "transicao_invalida", status: "changes_requested" });
+  });
+
+  it("vencido, o pedido ainda impede a aprovação, e o 409 diz que a marca pode trocá-lo", async () => {
+    const { t, id } = await scriptWithRequestDue("2026-03-12");
+    t.setNow(FIRST_INSTANT_OF_MARCH_13_SP);
+    const res = await t.post(`/scripts/${id}/approve`);
+    expect(res.status).toBe(409);
+    expect(await json(res)).toMatchObject({
+      error: "transicao_invalida",
+      allowed_actions: { brand: ["request_changes"], creator: ["submit_version"] },
+    });
+  });
+});
+
 describe("reenvio do criador", () => {
   async function scriptWaitingCreator(dueDate: string) {
     const t = setup();
@@ -209,6 +287,22 @@ describe("aprovação", () => {
     expect(() =>
       t.db.prepare("UPDATE script_versions SET content = 'outro' WHERE script_id = ?").run(script.id),
     ).toThrow(/imutável/);
+  });
+});
+
+describe("banco", () => {
+  it("recusa, na abertura, um banco criado por outra versão do schema", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "roteiros-")), "antigo.sqlite");
+    const old = new DatabaseSync(path);
+    old.exec("CREATE TABLE scripts (id TEXT PRIMARY KEY)");
+    old.close();
+    expect(() => openDatabase(path)).toThrow(/outra versão do schema/);
+  });
+
+  it("reabre sem erro um banco da versão atual", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "roteiros-")), "atual.sqlite");
+    openDatabase(path).close();
+    expect(() => openDatabase(path).close()).not.toThrow();
   });
 });
 
